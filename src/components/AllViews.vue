@@ -188,11 +188,13 @@ const onFileChange = async (event) => {
 // Process the PDF and generate email-specific PDFs
 // Use a plain object to store URLs outside reactivity
 
+const isProcessing = ref(false)
+
 const processPDF = async () => {
   corrupted.value = false;
-  generatedPdfUrls.value = [];  // Clear previous URLs
-
-  const rawUrls = [];  // Store URLs outside reactivity
+  generatedPdfUrls.value = [];
+  statusLog.value = [];
+  isProcessing.value = true; // Flag to indicate processing
 
   try {
     if (!pdfFile.value || !originalPdfDoc.value) {
@@ -202,55 +204,87 @@ const processPDF = async () => {
     const pdf = await pdfjs.getDocument({ data: pdfFile.value }).promise;
     statusLog.value.unshift(`PDF loaded with ${pdf.numPages} pages.`);
 
-    const pageTexts = await Promise.all(
-      Array.from({ length: pdf.numPages }, (_, i) =>
-        pdf.getPage(i + 1).then(page =>
-          page.getTextContent().then(content =>
-            content.items.map(item => item.str).join(' ')
-          )
-        )
-      )
-    );
+    const totalPages = pdf.numPages;
+    let currentPageIndex = 0;
 
-    const emailTasks = emailAddresses.map(async (email) => {
-      const emailPdf = await PDFDocument.create();
-      let emailPagesFound = false;
+    // Initialize PDF documents for each email
+    const emailPdfs = {};
+    for (const email of emailAddresses) {
+      emailPdfs[email] = await PDFDocument.create();
+    }
 
-      for (let i = 0; i < pdf.numPages; i++) {
-        const text = pageTexts[i];
+    const processPage = async () => {
+      if (currentPageIndex < totalPages) {
+        try {
+          const page = await pdf.getPage(currentPageIndex + 1);
+          const content = await page.getTextContent();
+          const text = content.items.map(item => item.str).join(' ');
 
+          // Process the text for this page
+          await processPageText(text, currentPageIndex, emailPdfs);
+
+          // Release resources
+          page.cleanup();
+          content.items = null;
+
+          statusLog.value.unshift(`Processed page ${currentPageIndex + 1}/${totalPages}`);
+        } catch (error) {
+          console.error(`Error processing page ${currentPageIndex + 1}:`, error);
+          statusLog.value.unshift(`Error processing page ${currentPageIndex + 1}. Skipping.`);
+        } finally {
+          currentPageIndex++;
+          // Introduce a delay
+          setTimeout(processPage, 50);
+        }
+      } else {
+        // Processing complete
+        isProcessing.value = false;
+        statusLog.value.unshift('All pages processed successfully.');
+        await handlePageTexts(emailPdfs);
+      }
+    };
+
+    const processPageText = async (text, pageIndex, emailPdfs) => {
+      // Check for email addresses in the text
+      for (const email of emailAddresses) {
         if (text.includes(email)) {
-          const [copiedPage] = await emailPdf.copyPages(originalPdfDoc.value, [i]);
-          emailPdf.addPage(copiedPage);
-          emailPagesFound = true;
+          // Extract the page using pdf-lib
+          const [copiedPage] = await emailPdfs[email].copyPages(originalPdfDoc.value, [pageIndex]);
+          emailPdfs[email].addPage(copiedPage);
+          statusLog.value.unshift(`Page ${pageIndex + 1} added for ${email}`);
+        }
+      }
+    };
 
-          statusLog.value.unshift(`Page ${i + 1} added for ${email}`);
+    // Define the handlePageTexts function
+    const handlePageTexts = async (emailPdfs) => {
+      const rawUrls = [];
+
+      for (const email of emailAddresses) {
+        const emailPdf = emailPdfs[email];
+        if (emailPdf.getPageCount() > 0) {
+          const pdfBytes = await emailPdf.save();
+          const blob = new Blob([pdfBytes], { type: 'application/pdf' });
+          rawUrls.push({
+            email,
+            url: URL.createObjectURL(blob),
+          });
+          statusLog.value.unshift(`PDF generated for ${email}`);
         }
       }
 
-      if (emailPagesFound) {
-        const pdfBytes = await emailPdf.save();
-        const blob = new Blob([pdfBytes], { type: 'application/pdf' });
-        rawUrls.push({
-          email,
-          url: URL.createObjectURL(blob),
-        });
+      // Assign the generated URLs after processing all emails
+      generatedPdfUrls.value = rawUrls;
+    };
 
-        statusLog.value.unshift(`PDF generated for ${email}`);
-      }
-    });
-
-    await Promise.all(emailTasks);
-
-    // Only assign after processing completes
-    generatedPdfUrls.value = rawUrls;
-
-    statusLog.value.unshift('All PDFs processed successfully.');
+    processPage(); // Start processing pages
   } catch (error) {
     console.error('Error processing PDF:', error);
     corrupted.value = true;
+    isProcessing.value = false;
   }
 };
+
 </script>
 
 <style scoped>
